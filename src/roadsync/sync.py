@@ -1,13 +1,12 @@
 """
 RoadSync - Data Synchronization for BlackRoad
-Real-time sync, conflict resolution, and offline-first patterns.
+Sync data between sources with conflict resolution.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
-import asyncio
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import hashlib
 import json
 import logging
@@ -18,446 +17,313 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
-class SyncStatus(str, Enum):
-    """Sync status."""
-    PENDING = "pending"
-    SYNCING = "syncing"
-    SYNCED = "synced"
-    CONFLICT = "conflict"
-    ERROR = "error"
+class SyncDirection(str, Enum):
+    PUSH = "push"
+    PULL = "pull"
+    BIDIRECTIONAL = "bidirectional"
 
 
 class ConflictStrategy(str, Enum):
-    """Conflict resolution strategies."""
-    LAST_WRITE_WINS = "last_write_wins"
-    FIRST_WRITE_WINS = "first_write_wins"
-    CLIENT_WINS = "client_wins"
-    SERVER_WINS = "server_wins"
+    SOURCE_WINS = "source_wins"
+    TARGET_WINS = "target_wins"
+    NEWER_WINS = "newer_wins"
     MERGE = "merge"
     MANUAL = "manual"
 
 
+class SyncStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CONFLICT = "conflict"
+
+
 @dataclass
 class SyncRecord:
-    """A syncable record."""
     id: str
     data: Dict[str, Any]
-    version: int = 0
+    version: int = 1
     checksum: str = ""
-    created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     deleted: bool = False
-    local_only: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.checksum:
             self.checksum = self._compute_checksum()
 
     def _compute_checksum(self) -> str:
-        data_str = json.dumps(self.data, sort_keys=True)
+        data_str = json.dumps(self.data, sort_keys=True, default=str)
         return hashlib.md5(data_str.encode()).hexdigest()
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "data": self.data,
-            "version": self.version,
-            "checksum": self.checksum,
-            "updated_at": self.updated_at.isoformat(),
-            "deleted": self.deleted
-        }
+    def update(self, data: Dict[str, Any]) -> None:
+        self.data = data
+        self.version += 1
+        self.checksum = self._compute_checksum()
+        self.updated_at = datetime.now()
 
 
 @dataclass
 class SyncConflict:
-    """A sync conflict."""
-    id: str
     record_id: str
-    local_record: SyncRecord
-    remote_record: SyncRecord
-    created_at: datetime = field(default_factory=datetime.now)
+    source_record: SyncRecord
+    target_record: SyncRecord
     resolved: bool = False
-    resolution: Optional[str] = None
+    resolution: Optional[SyncRecord] = None
 
 
 @dataclass
-class SyncDelta:
-    """Changes to sync."""
-    created: List[SyncRecord] = field(default_factory=list)
-    updated: List[SyncRecord] = field(default_factory=list)
-    deleted: List[str] = field(default_factory=list)
-    since_version: int = 0
-    current_version: int = 0
+class SyncChange:
+    record_id: str
+    action: str  # create, update, delete
+    source_version: int
+    target_version: int
+    data: Dict[str, Any]
+
+
+@dataclass
+class SyncResult:
+    success: bool
+    changes_pushed: int = 0
+    changes_pulled: int = 0
+    conflicts: List[SyncConflict] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    duration_ms: float = 0
 
 
 class SyncStore:
-    """Local sync store."""
-
     def __init__(self):
         self.records: Dict[str, SyncRecord] = {}
-        self.pending_changes: List[SyncRecord] = []
-        self.conflicts: Dict[str, SyncConflict] = {}
-        self.version = 0
+        self.version_history: Dict[str, List[int]] = {}
         self._lock = threading.Lock()
 
     def get(self, record_id: str) -> Optional[SyncRecord]:
         return self.records.get(record_id)
 
-    def save(self, record: SyncRecord, track_change: bool = True) -> None:
+    def put(self, record: SyncRecord) -> None:
         with self._lock:
-            record.updated_at = datetime.now()
-            record.version = self.version + 1
-            record.checksum = record._compute_checksum()
-            
             self.records[record.id] = record
-            self.version = record.version
-            
-            if track_change:
-                self.pending_changes.append(record)
+            if record.id not in self.version_history:
+                self.version_history[record.id] = []
+            self.version_history[record.id].append(record.version)
 
-    def delete(self, record_id: str, track_change: bool = True) -> bool:
+    def delete(self, record_id: str) -> bool:
         with self._lock:
-            record = self.records.get(record_id)
-            if record:
-                record.deleted = True
-                record.updated_at = datetime.now()
-                record.version = self.version + 1
-                self.version = record.version
-                
-                if track_change:
-                    self.pending_changes.append(record)
+            if record_id in self.records:
+                self.records[record_id].deleted = True
                 return True
             return False
 
-    def get_pending_changes(self) -> List[SyncRecord]:
-        return self.pending_changes.copy()
+    def list_all(self) -> List[SyncRecord]:
+        return list(self.records.values())
 
-    def clear_pending_changes(self) -> None:
-        with self._lock:
-            self.pending_changes.clear()
+    def list_since(self, since: datetime) -> List[SyncRecord]:
+        return [r for r in self.records.values() if r.updated_at >= since]
 
-    def get_delta(self, since_version: int) -> SyncDelta:
-        """Get changes since a version."""
-        delta = SyncDelta(since_version=since_version, current_version=self.version)
-        
-        for record in self.records.values():
-            if record.version > since_version:
-                if record.deleted:
-                    delta.deleted.append(record.id)
-                elif record.version == 1:
-                    delta.created.append(record)
-                else:
-                    delta.updated.append(record)
-        
-        return delta
-
-    def add_conflict(self, conflict: SyncConflict) -> None:
-        with self._lock:
-            self.conflicts[conflict.id] = conflict
-
-    def resolve_conflict(self, conflict_id: str, resolution: SyncRecord) -> bool:
-        with self._lock:
-            conflict = self.conflicts.get(conflict_id)
-            if conflict:
-                conflict.resolved = True
-                self.save(resolution, track_change=True)
-                return True
-            return False
+    def get_version(self, record_id: str) -> int:
+        record = self.records.get(record_id)
+        return record.version if record else 0
 
 
 class ConflictResolver:
-    """Resolve sync conflicts."""
-
-    def __init__(self, strategy: ConflictStrategy = ConflictStrategy.LAST_WRITE_WINS):
+    def __init__(self, strategy: ConflictStrategy = ConflictStrategy.NEWER_WINS):
         self.strategy = strategy
-        self.custom_resolvers: Dict[str, Callable] = {}
+        self.custom_resolver: Optional[Callable] = None
 
-    def register_resolver(self, record_type: str, resolver: Callable) -> None:
-        self.custom_resolvers[record_type] = resolver
-
-    def resolve(self, local: SyncRecord, remote: SyncRecord) -> SyncRecord:
-        """Resolve conflict between local and remote records."""
-        record_type = local.metadata.get("type", "default")
-        
-        if record_type in self.custom_resolvers:
-            return self.custom_resolvers[record_type](local, remote)
-
-        if self.strategy == ConflictStrategy.LAST_WRITE_WINS:
-            return remote if remote.updated_at > local.updated_at else local
-        
-        elif self.strategy == ConflictStrategy.FIRST_WRITE_WINS:
-            return local if local.updated_at < remote.updated_at else remote
-        
-        elif self.strategy == ConflictStrategy.CLIENT_WINS:
-            return local
-        
-        elif self.strategy == ConflictStrategy.SERVER_WINS:
-            return remote
-        
+    def resolve(self, conflict: SyncConflict) -> SyncRecord:
+        if self.strategy == ConflictStrategy.SOURCE_WINS:
+            return conflict.source_record
+        elif self.strategy == ConflictStrategy.TARGET_WINS:
+            return conflict.target_record
+        elif self.strategy == ConflictStrategy.NEWER_WINS:
+            if conflict.source_record.updated_at >= conflict.target_record.updated_at:
+                return conflict.source_record
+            return conflict.target_record
         elif self.strategy == ConflictStrategy.MERGE:
-            return self._merge_records(local, remote)
-        
-        else:
-            # Manual resolution required
-            return None
+            return self._merge(conflict)
+        elif self.custom_resolver:
+            return self.custom_resolver(conflict)
+        return conflict.source_record
 
-    def _merge_records(self, local: SyncRecord, remote: SyncRecord) -> SyncRecord:
-        """Merge two records."""
-        merged_data = remote.data.copy()
-        
-        # Simple merge: local values override if updated more recently
-        if local.updated_at > remote.updated_at:
-            for key, value in local.data.items():
-                merged_data[key] = value
-        
+    def _merge(self, conflict: SyncConflict) -> SyncRecord:
+        merged_data = {**conflict.target_record.data, **conflict.source_record.data}
         return SyncRecord(
-            id=local.id,
+            id=conflict.record_id,
             data=merged_data,
-            version=max(local.version, remote.version) + 1,
-            metadata=local.metadata
+            version=max(conflict.source_record.version, conflict.target_record.version) + 1
         )
 
 
 class SyncEngine:
-    """Core sync engine."""
-
-    def __init__(
-        self,
-        store: SyncStore,
-        resolver: ConflictResolver
-    ):
-        self.store = store
-        self.resolver = resolver
-        self._hooks: Dict[str, List[Callable]] = {
-            "before_sync": [],
-            "after_sync": [],
+    def __init__(self, source: SyncStore, target: SyncStore, direction: SyncDirection = SyncDirection.BIDIRECTIONAL):
+        self.source = source
+        self.target = target
+        self.direction = direction
+        self.resolver = ConflictResolver()
+        self.last_sync: Optional[datetime] = None
+        self.hooks: Dict[str, List[Callable]] = {
+            "before_sync": [], "after_sync": [],
+            "before_push": [], "after_push": [],
+            "before_pull": [], "after_pull": [],
             "on_conflict": []
         }
 
     def add_hook(self, event: str, handler: Callable) -> None:
-        if event in self._hooks:
-            self._hooks[event].append(handler)
+        if event in self.hooks:
+            self.hooks[event].append(handler)
 
-    def _trigger_hooks(self, event: str, *args) -> None:
-        for handler in self._hooks.get(event, []):
+    def _emit(self, event: str, data: Any = None) -> None:
+        for handler in self.hooks.get(event, []):
             try:
-                handler(*args)
+                handler(data)
             except Exception as e:
-                logger.error(f"Sync hook error: {e}")
+                logger.error(f"Hook error: {e}")
 
-    async def push(self, remote_store: "SyncStore") -> SyncDelta:
-        """Push local changes to remote."""
-        self._trigger_hooks("before_sync", "push")
+    def sync(self, full: bool = False) -> SyncResult:
+        start = time.time()
+        self._emit("before_sync")
         
-        pending = self.store.get_pending_changes()
-        pushed = SyncDelta()
-        conflicts = []
-
-        for local_record in pending:
-            remote_record = remote_store.get(local_record.id)
+        since = None if full else self.last_sync
+        result = SyncResult(success=True)
+        
+        try:
+            if self.direction in [SyncDirection.PUSH, SyncDirection.BIDIRECTIONAL]:
+                push_result = self._push(since)
+                result.changes_pushed = push_result
             
-            if remote_record and remote_record.checksum != local_record.checksum:
-                # Conflict detected
-                if remote_record.version > local_record.version - 1:
-                    resolved = self.resolver.resolve(local_record, remote_record)
-                    
-                    if resolved:
-                        remote_store.save(resolved, track_change=False)
-                        pushed.updated.append(resolved)
-                    else:
-                        conflict = SyncConflict(
-                            id=str(uuid.uuid4()),
-                            record_id=local_record.id,
-                            local_record=local_record,
-                            remote_record=remote_record
-                        )
-                        self.store.add_conflict(conflict)
-                        self._trigger_hooks("on_conflict", conflict)
-                        conflicts.append(conflict)
-                else:
-                    remote_store.save(local_record, track_change=False)
-                    pushed.updated.append(local_record)
-            else:
-                remote_store.save(local_record, track_change=False)
-                if remote_record:
-                    pushed.updated.append(local_record)
-                else:
-                    pushed.created.append(local_record)
-
-        self.store.clear_pending_changes()
-        self._trigger_hooks("after_sync", "push", pushed)
+            if self.direction in [SyncDirection.PULL, SyncDirection.BIDIRECTIONAL]:
+                pull_result = self._pull(since)
+                result.changes_pulled = pull_result
+            
+            self.last_sync = datetime.now()
+        except Exception as e:
+            result.success = False
+            result.errors.append(str(e))
+            logger.error(f"Sync failed: {e}")
         
+        result.duration_ms = (time.time() - start) * 1000
+        self._emit("after_sync", result)
+        return result
+
+    def _push(self, since: datetime = None) -> int:
+        self._emit("before_push")
+        records = self.source.list_since(since) if since else self.source.list_all()
+        pushed = 0
+        
+        for record in records:
+            target_record = self.target.get(record.id)
+            
+            if target_record is None:
+                self.target.put(record)
+                pushed += 1
+            elif target_record.checksum != record.checksum:
+                if target_record.version >= record.version:
+                    conflict = SyncConflict(record.id, record, target_record)
+                    self._emit("on_conflict", conflict)
+                    resolved = self.resolver.resolve(conflict)
+                    self.target.put(resolved)
+                else:
+                    self.target.put(record)
+                pushed += 1
+        
+        self._emit("after_push", pushed)
         return pushed
 
-    async def pull(self, remote_store: "SyncStore") -> SyncDelta:
-        """Pull changes from remote."""
-        self._trigger_hooks("before_sync", "pull")
+    def _pull(self, since: datetime = None) -> int:
+        self._emit("before_pull")
+        records = self.target.list_since(since) if since else self.target.list_all()
+        pulled = 0
         
-        delta = remote_store.get_delta(self.store.version)
-        conflicts = []
-
-        for record in delta.created + delta.updated:
-            local_record = self.store.get(record.id)
+        for record in records:
+            source_record = self.source.get(record.id)
             
-            if local_record and local_record.checksum != record.checksum:
-                # Check for conflict
-                if local_record in self.store.pending_changes:
-                    resolved = self.resolver.resolve(local_record, record)
-                    
-                    if resolved:
-                        self.store.save(resolved, track_change=False)
-                    else:
-                        conflict = SyncConflict(
-                            id=str(uuid.uuid4()),
-                            record_id=record.id,
-                            local_record=local_record,
-                            remote_record=record
-                        )
-                        self.store.add_conflict(conflict)
-                        self._trigger_hooks("on_conflict", conflict)
-                        conflicts.append(conflict)
+            if source_record is None:
+                self.source.put(record)
+                pulled += 1
+            elif source_record.checksum != record.checksum:
+                if source_record.version >= record.version:
+                    conflict = SyncConflict(record.id, source_record, record)
+                    self._emit("on_conflict", conflict)
+                    resolved = self.resolver.resolve(conflict)
+                    self.source.put(resolved)
                 else:
-                    self.store.save(record, track_change=False)
-            else:
-                self.store.save(record, track_change=False)
-
-        for record_id in delta.deleted:
-            self.store.delete(record_id, track_change=False)
-
-        self._trigger_hooks("after_sync", "pull", delta)
+                    self.source.put(record)
+                pulled += 1
         
-        return delta
+        self._emit("after_pull", pulled)
+        return pulled
+
+    def diff(self) -> Dict[str, List[str]]:
+        source_ids = set(self.source.records.keys())
+        target_ids = set(self.target.records.keys())
+        
+        return {
+            "source_only": list(source_ids - target_ids),
+            "target_only": list(target_ids - source_ids),
+            "both": list(source_ids & target_ids),
+            "conflicts": [
+                id for id in (source_ids & target_ids)
+                if self.source.get(id).checksum != self.target.get(id).checksum
+            ]
+        }
 
 
 class SyncManager:
-    """High-level sync management."""
-
-    def __init__(
-        self,
-        conflict_strategy: ConflictStrategy = ConflictStrategy.LAST_WRITE_WINS
-    ):
-        self.local_store = SyncStore()
-        self.resolver = ConflictResolver(conflict_strategy)
-        self.engine = SyncEngine(self.local_store, self.resolver)
-        self._auto_sync_task: Optional[asyncio.Task] = None
+    def __init__(self):
+        self.engines: Dict[str, SyncEngine] = {}
         self._running = False
 
-    def create(self, record_id: str, data: Dict[str, Any], **metadata) -> SyncRecord:
-        """Create a new record."""
-        record = SyncRecord(
-            id=record_id,
-            data=data,
-            metadata=metadata
-        )
-        self.local_store.save(record)
-        return record
+    def register(self, name: str, engine: SyncEngine) -> None:
+        self.engines[name] = engine
 
-    def update(self, record_id: str, data: Dict[str, Any]) -> Optional[SyncRecord]:
-        """Update a record."""
-        record = self.local_store.get(record_id)
-        if not record:
-            return None
-        
-        record.data.update(data)
-        self.local_store.save(record)
-        return record
+    def sync(self, name: str, full: bool = False) -> Optional[SyncResult]:
+        engine = self.engines.get(name)
+        if engine:
+            return engine.sync(full)
+        return None
 
-    def delete(self, record_id: str) -> bool:
-        """Delete a record."""
-        return self.local_store.delete(record_id)
+    def sync_all(self, full: bool = False) -> Dict[str, SyncResult]:
+        results = {}
+        for name, engine in self.engines.items():
+            results[name] = engine.sync(full)
+        return results
 
-    def get(self, record_id: str) -> Optional[SyncRecord]:
-        """Get a record."""
-        return self.local_store.get(record_id)
-
-    def list(self, include_deleted: bool = False) -> List[SyncRecord]:
-        """List all records."""
-        records = list(self.local_store.records.values())
-        if not include_deleted:
-            records = [r for r in records if not r.deleted]
-        return records
-
-    async def sync(self, remote_store: SyncStore) -> Dict[str, Any]:
-        """Perform full sync."""
-        # Pull first
-        pull_delta = await self.engine.pull(remote_store)
-        
-        # Then push
-        push_delta = await self.engine.push(remote_store)
-        
-        return {
-            "pulled": {
-                "created": len(pull_delta.created),
-                "updated": len(pull_delta.updated),
-                "deleted": len(pull_delta.deleted)
-            },
-            "pushed": {
-                "created": len(push_delta.created),
-                "updated": len(push_delta.updated),
-                "deleted": len(push_delta.deleted)
-            },
-            "conflicts": len(self.local_store.conflicts)
-        }
-
-    def get_conflicts(self) -> List[SyncConflict]:
-        """Get unresolved conflicts."""
-        return [c for c in self.local_store.conflicts.values() if not c.resolved]
-
-    def resolve_conflict(self, conflict_id: str, choose: str = "local") -> bool:
-        """Resolve a conflict."""
-        conflict = self.local_store.conflicts.get(conflict_id)
-        if not conflict:
-            return False
-        
-        resolution = conflict.local_record if choose == "local" else conflict.remote_record
-        return self.local_store.resolve_conflict(conflict_id, resolution)
-
-    async def start_auto_sync(self, remote_store: SyncStore, interval: int = 30) -> None:
-        """Start automatic sync."""
+    async def start_periodic_sync(self, interval_seconds: int = 60) -> None:
+        import asyncio
         self._running = True
-        
-        async def sync_loop():
-            while self._running:
-                try:
-                    await self.sync(remote_store)
-                except Exception as e:
-                    logger.error(f"Auto sync error: {e}")
-                await asyncio.sleep(interval)
-        
-        self._auto_sync_task = asyncio.create_task(sync_loop())
+        while self._running:
+            self.sync_all()
+            await asyncio.sleep(interval_seconds)
 
-    async def stop_auto_sync(self) -> None:
-        """Stop automatic sync."""
+    def stop(self) -> None:
         self._running = False
-        if self._auto_sync_task:
-            self._auto_sync_task.cancel()
 
 
-# Example usage
-async def example_usage():
-    """Example sync usage."""
-    # Create managers
-    client = SyncManager(conflict_strategy=ConflictStrategy.LAST_WRITE_WINS)
-    server_store = SyncStore()
+def example_usage():
+    source = SyncStore()
+    target = SyncStore()
+    
+    source.put(SyncRecord(id="1", data={"name": "Alice", "age": 30}))
+    source.put(SyncRecord(id="2", data={"name": "Bob", "age": 25}))
+    source.put(SyncRecord(id="3", data={"name": "Charlie", "age": 35}))
+    
+    target.put(SyncRecord(id="2", data={"name": "Bob", "age": 26}))
+    target.put(SyncRecord(id="4", data={"name": "Diana", "age": 28}))
+    
+    engine = SyncEngine(source, target, SyncDirection.BIDIRECTIONAL)
+    engine.resolver = ConflictResolver(ConflictStrategy.NEWER_WINS)
+    
+    diff = engine.diff()
+    print(f"Source only: {diff['source_only']}")
+    print(f"Target only: {diff['target_only']}")
+    print(f"Conflicts: {diff['conflicts']}")
+    
+    result = engine.sync()
+    print(f"\nSync result:")
+    print(f"  Pushed: {result.changes_pushed}")
+    print(f"  Pulled: {result.changes_pulled}")
+    print(f"  Duration: {result.duration_ms:.2f}ms")
+    
+    print(f"\nSource records: {len(source.list_all())}")
+    print(f"Target records: {len(target.list_all())}")
 
-    # Create records locally
-    client.create("user-1", {"name": "Alice", "email": "alice@example.com"})
-    client.create("user-2", {"name": "Bob", "email": "bob@example.com"})
-
-    print(f"Local records: {len(client.list())}")
-
-    # Sync to server
-    result = await client.sync(server_store)
-    print(f"Sync result: {result}")
-
-    # Update locally
-    client.update("user-1", {"name": "Alice Smith"})
-
-    # Sync again
-    result = await client.sync(server_store)
-    print(f"Sync after update: {result}")
-
-    # Check server
-    print(f"Server records: {len(server_store.records)}")
-    print(f"Server user-1: {server_store.get('user-1').data}")
